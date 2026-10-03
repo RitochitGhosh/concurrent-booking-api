@@ -9,7 +9,8 @@ import (
 )
 
 func TestConcurrentBookig_ExactlyOneWins(t *testing.T) {
-	store := NewMemoryStore()
+	// store := NewMemoryStore()
+	store := NewConcurrentStore()
 	svc := NewService(store)
 
 	const numGoroutines = 100_000
