@@ -131,19 +131,3 @@ go run ./cmd
 ```
 
 It currently exits without output because `main` is empty.
-
-## Publish the `02/concurrent-store` branch
-
-From `01/memory-store`, create the new branch with your current uncommitted changes, test, commit the implementation and documentation, then push:
-
-```sh
-git switch -c 02/concurrent-store
-go test ./...
-go test -race ./...
-git add README.md internal/booking/concurrent_Store.go internal/booking/memory_Store.go internal/booking/service_test.go
-git diff --cached
-git commit -m "Add concurrent booking store with pessimistic locking"
-git push -u origin 02/concurrent-store
-```
-
-Review the staged diff before committing and proceed with the commit and push after the tests pass. If the branch already exists locally, use `git switch 02/concurrent-store` instead of creating it again. The `-u` option sets its upstream so future pushes can use `git push`.
