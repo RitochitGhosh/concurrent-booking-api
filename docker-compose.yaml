@@ -1,16 +1,38 @@
 services:
-    redis:
-        container_name: redis
-        image: redis:7-alpine
-        ports:
-            - '6380:6379'
-    redis-commander:
-        container_name: redis-commander
-        hostname: redis-commander
-        image: ghcr.io/joeferner/redis-commander:latest
-        restart: always
-        environment:
-            - REDIS_HOST=local:redis:6379
-        ports:
-            - '8081:8081'
-        user: redis
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory-policy", "noeviction"]
+    ports:
+      - '127.0.0.1:6380:6379'
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+  mongo:
+    image: mongo:8
+    profiles: ["local-db"]
+    ports:
+      - '127.0.0.1:27017:27017'
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+  redis-commander:
+    image: ghcr.io/joeferner/redis-commander:latest
+    profiles: ["tools"]
+    environment:
+      REDIS_HOSTS: local:redis:6379
+    ports:
+      - '127.0.0.1:8081:8081'
+    depends_on:
+      redis:
+        condition: service_healthy
+volumes:
+  redis-data:
+  mongo-data:
