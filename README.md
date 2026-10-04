@@ -1,133 +1,71 @@
 # Seat Booking API
 
-A Go prototype for exploring a common booking problem: many users try to reserve the same movie seat at the same time, but only one booking should succeed.
+A Go prototype for preventing double bookings when many users try to reserve the same movie seat. The current `RedisStore` creates temporary seat holds in shared Redis storage.
 
-The project now includes a concurrent in-memory store using Go's `sync.RWMutex`. The original memory store remains available to illustrate why an ordinary map needs synchronization.
+## Architecture
 
-## The problem: preventing double bookings
-
-Checking whether a seat is available and saving its booking must happen as one atomic operation. If those steps can overlap between requests, two users can both see an available seat and both claim it.
-
-For a single seat, the intended result is:
-
-- Exactly one request succeeds.
-- Every subsequent request receives `ErrSeatAlreadyBooked` (`seat is already taken`).
-
-The current test launches 100,000 goroutines that all attempt to book seat `A1` for `screen-1`. It expects one success and 99,999 failures.
-
-## What is implemented
-
-| File | Purpose |
-| --- | --- |
-| `internal/booking/domain.go` | Defines `Booking`, `BookingStore`, and the duplicate-booking error. |
-| `internal/booking/memory_Store.go` | Original in-memory store without synchronization. |
-| `internal/booking/concurrent_Store.go` | In-memory store that protects bookings with an `RWMutex`. |
-| `internal/booking/service.go` | Delegates booking requests to whichever store is supplied. |
-| `internal/booking/service_test.go` | Tests concurrent attempts using `NewConcurrentStore()`. |
-| `cmd/main.go` | Empty entry point; there is no HTTP server yet. |
-
-Both stores implement `BookingStore`, so callers can select the implementation when creating the service:
-
-```go
-store := booking.NewConcurrentStore()
-svc := booking.NewService(store)
-
-err := svc.Book(booking.Booking{
-    MovieID: "screen-1",
-    SeatID:  "A1",
-    UserID:  "user-1",
-})
+```text
+Caller → booking.Service → BookingStore → RedisStore → Redis
 ```
 
-This example assumes the caller has imported the internal `booking` package from within this module.
+- **Domain (`internal/booking/domain.go`):** defines `Booking`, the `BookingStore` interface, and `ErrSeatAlreadyBooked`.
+- **Service (`internal/booking/service.go`):** delegates booking requests to the injected store.
+- **Redis store (`internal/booking/redis_Store.go`):** creates a session UUID and claims a seat using an atomic Redis write with a two-minute expiry.
+- **Redis adapter (`internal/adapters/redis/redi.go`):** creates the Redis client and checks connectivity with `PING`.
+- **Entry point (`cmd/main.go`):** starts an HTTP listener on port 8080. Booking routes and service wiring are not implemented yet; the test wires the service to Redis.
 
-## Why the earlier memory store failed
+`MemoryStore` and `ConcurrentStore` are earlier implementations of the same interface. `MemoryStore` uses an unsynchronized map; `ConcurrentStore` protects its map with `sync.RWMutex`. Redis lets separate application instances coordinate seat holds when they share the same Redis server.
 
-`MemoryStore.Book` checks the map and then writes to it without a lock. Two goroutines can interleave like this:
+## How RedisStore works
 
-| Step | Request A | Request B |
+| Redis key | Value | Expiry |
 | --- | --- | --- |
-| 1 | Checks `A1`: available | |
-| 2 | | Checks `A1`: available |
-| 3 | Saves its booking | |
-| 4 | | Saves its booking |
+| `seat:{movieID}:{seatID}` | Booking JSON with a generated session ID | Two minutes |
+| `session:{sessionID}` | The corresponding seat key | Two minutes |
 
-This illustrates the missing atomicity: both requests could report success. In practice, Go maps also do not support unsynchronized access involving concurrent writes. The original test run crashed with `fatal error: concurrent map writes`. Reads during writes, including listing bookings, are unsafe too.
+1. `Service.Book` calls `RedisStore.Book`, which creates a temporary hold.
+2. The store generates a UUID, adds it to the booking, and serializes the booking to JSON.
+3. Redis executes `SET seat:{movieID}:{seatID} <json> NX` with a two-minute TTL. `NX` only creates the key if it does not already exist, so checking availability and claiming the seat happen atomically.
+4. The winner creates the session reverse-lookup key and logs the hold. Competing requests receive `ErrSeatAlreadyBooked` while the seat key exists.
+5. When the seat key expires, the seat becomes available again.
 
-The test's atomic counters protect its success and failure counts. They do not protect the store's map or make the booking operation atomic.
+The seat key includes both movie and seat IDs, so `A1` for different movies can be held independently. Separate showtimes would need their own identity in the key.
 
-## How the concurrent store uses locks
+## Current limitations
 
-`ConcurrentStore` embeds a `sync.RWMutex` alongside its map. Every store method that accesses the map acquires the appropriate lock.
+- `Book` returns only an error; the generated session is logged rather than returned to the caller. Confirmation, cancellation, and payment handling are not implemented.
+- `ListBookings` currently returns an empty slice.
+- The hold result includes `Status: "held"` and `ExpiresAt`, but those fields are populated after serialization, so the stored JSON does not receive these values automatically.
+- Seat and session keys are written separately, without a transaction. Redis command errors are not propagated correctly: failed seat writes are reported as duplicate bookings, and session-write errors are ignored.
+- The Compose setup has no configured Redis data volume, and the store does not validate IDs or check whether a seat exists.
 
-### Booking: exclusive access
+## Run locally
 
-```go
-s.Lock()
-defer s.Unlock()
-
-if _, exists := s.bookings[b.SeatID]; exists {
-    return ErrSeatAlreadyBooked
-}
-
-s.bookings[b.SeatID] = b
-return nil
-```
-
-`Lock()` waits until exclusive access is available. While the lock is held, other calls to `Book` and `ListBookings` on this store must wait. The lock covers **both the availability check and the insertion**, so another request cannot slip between them.
-
-After the first request saves the booking and releases the lock, the next request sees the occupied seat and returns the duplicate-booking error. `defer s.Unlock()` releases the lock when the method returns, including when it returns an error.
-
-Locking only the insertion would not be sufficient: requests could still check availability simultaneously before either saved its booking.
-
-### Listing: shared read access
-
-`ListBookings` uses `RLock()` and `defer RUnlock()`. Multiple callers can read at the same time, but a reader cannot access the map while a writer holds the exclusive lock. A writer also waits for active readers to finish.
-
-The read lock stays held throughout the map iteration, protecting the entire scan. Pointer receivers keep these methods operating on the same mutex and map; do not copy a `ConcurrentStore` after its mutex has been used.
-
-## Pessimistic locking approach
-
-This implementation uses **pessimistic locking**: it assumes requests may conflict and takes the lock before checking or changing shared state. Competing requests wait their turn, and each one sees the result of the previous booking.
-
-An optimistic approach would allow work to proceed and detect conflicts when committing, for example with a database uniqueness constraint or a version check. The current implementation instead resolves contention using an exclusive lock around the booking operation.
-
-The lock belongs to the whole store, so even bookings for different seats are serialized. This is straightforward and protects the current in-process data, but its guarantee applies only to callers sharing that same store instance.
-
-## Remaining limitations
-
-- **No persistence:** all bookings disappear when the process exits.
-- **No coordination between instances:** separate stores or application processes have separate maps and locks. They can each accept the same seat. A shared database with an appropriate uniqueness constraint and atomic booking operation would be needed to enforce the rule across instances.
-- **Seat identity is too broad:** the map key is only `SeatID`. Booking `A1` for one movie prevents booking `A1` for another movie. Separate showtimes need a key that identifies the showtime and seat.
-- **One lock for all seats:** unrelated booking requests wait on the same mutex. Listing scans all bookings while holding a read lock, which can delay writers as the store grows.
-- **No validation or booking lifecycle:** the code does not validate IDs, generate booking IDs or statuses, check that seats exist, or implement cancellation, temporary holds, expiry, or payment handling.
-- **No HTTP API yet:** `main` is empty; the service is currently exercised through Go code and tests.
-- **Limited test coverage:** the existing test counts successful and failed requests for one seat. It does not verify the exact error, the saved booking, concurrent listing, or behavior across movies or showtimes. A passing race check covers only the execution paths exercised by tests.
-
-## How to test
-
-Use the Go toolchain specified in `go.mod` (Go 1.26.7). From the repository root:
+Use the Go toolchain specified in `go.mod` (Go 1.26.7) and Docker Compose.
 
 ```sh
+docker compose up -d
 go mod download
-go test ./...
-go test -race ./...
+go run ./cmd
 ```
 
-Run only the concurrent booking test (the spelling matches the current function name):
+Redis is exposed at `localhost:6380`. Redis Commander is available at `http://localhost:8081`. The HTTP listener runs at `http://localhost:8080` and returns 404 until routes are added.
+
+## Test concurrent booking
+
+With Redis running:
 
 ```sh
 go test ./internal/booking -run '^TestConcurrentBookig_ExactlyOneWins$' -count=1 -v
 ```
 
-The test currently uses `NewConcurrentStore()` and should pass with one success and 99,999 failures. Switching it to `NewMemoryStore()` demonstrates the unsafe implementation; a run can crash or report races, and an occasional passing run does not prove safety.
+The test launches 100,000 goroutines against `screen-1`, seat `A1`, and expects one success and 99,999 failures. Start with that seat key absent; an existing hold can cause all attempts to fail. Wait for its two-minute expiry before repeating the test. The test also assumes all attempts finish before the winning hold expires.
 
-The race detector requires a supported platform and a C compiler with cgo enabled. Launching 100,000 goroutines can consume substantial resources, especially with race detection.
-
-To run the entry point:
+To run all tests or enable Go's race detector:
 
 ```sh
-go run ./cmd
+go test ./...
+go test -race ./...
 ```
 
-It currently exits without output because `main` is empty.
+These tests currently require Redis at `localhost:6380`. The race detector requires a supported platform and a C compiler with cgo enabled; the 100,000-goroutine test can consume substantial resources.
