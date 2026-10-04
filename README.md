@@ -2,7 +2,9 @@
 
 A Go prototype for exploring a common booking problem: many users try to reserve the same movie seat at the same time, but only one booking should succeed.
 
-The project now includes a concurrent in-memory store using Go's `sync.RWMutex`. The original memory store remains available to illustrate why an ordinary map needs synchronization.
+This README explains the `02/concurrent-store` stage: an in-memory store using Go's `sync.RWMutex`. The original memory store remains available to illustrate why an ordinary map needs synchronization.
+
+The current working tree also contains later Redis work. Its test currently selects `RedisStore`, and `main` starts an HTTP listener on port 8080 with no registered routes. The explanations below focus on `ConcurrentStore`.
 
 ## The problem: preventing double bookings
 
@@ -23,8 +25,8 @@ The current test launches 100,000 goroutines that all attempt to book seat `A1` 
 | `internal/booking/memory_Store.go` | Original in-memory store without synchronization. |
 | `internal/booking/concurrent_Store.go` | In-memory store that protects bookings with an `RWMutex`. |
 | `internal/booking/service.go` | Delegates booking requests to whichever store is supplied. |
-| `internal/booking/service_test.go` | Tests concurrent attempts using `NewConcurrentStore()`. |
-| `cmd/main.go` | Empty entry point; there is no HTTP server yet. |
+| `internal/booking/service_test.go` | Tests concurrent attempts; the current working tree selects `RedisStore`. |
+| `cmd/main.go` | Starts an HTTP listener on port 8080; no routes are registered. |
 
 Both stores implement `BookingStore`, so callers can select the implementation when creating the service:
 
@@ -101,12 +103,12 @@ The lock belongs to the whole store, so even bookings for different seats are se
 - **Seat identity is too broad:** the map key is only `SeatID`. Booking `A1` for one movie prevents booking `A1` for another movie. Separate showtimes need a key that identifies the showtime and seat.
 - **One lock for all seats:** unrelated booking requests wait on the same mutex. Listing scans all bookings while holding a read lock, which can delay writers as the store grows.
 - **No validation or booking lifecycle:** the code does not validate IDs, generate booking IDs or statuses, check that seats exist, or implement cancellation, temporary holds, expiry, or payment handling.
-- **No HTTP API yet:** `main` is empty; the service is currently exercised through Go code and tests.
+- **No booking HTTP routes yet:** the current listener does not connect requests to the booking service.
 - **Limited test coverage:** the existing test counts successful and failed requests for one seat. It does not verify the exact error, the saved booking, concurrent listing, or behavior across movies or showtimes. A passing race check covers only the execution paths exercised by tests.
 
 ## How to test
 
-Use the Go toolchain specified in `go.mod` (Go 1.26.7). From the repository root:
+Use the Go toolchain specified in `go.mod` (Go 1.26.7). To test this stage, select `store := NewConcurrentStore()` in `service_test.go` and remove or comment out the Redis client initialization and unused Redis adapter import. The current Redis-selected test does not exercise the mutex implementation. From the repository root:
 
 ```sh
 go mod download
@@ -120,7 +122,7 @@ Run only the concurrent booking test (the spelling matches the current function 
 go test ./internal/booking -run '^TestConcurrentBookig_ExactlyOneWins$' -count=1 -v
 ```
 
-The test currently uses `NewConcurrentStore()` and should pass with one success and 99,999 failures. Switching it to `NewMemoryStore()` demonstrates the unsafe implementation; a run can crash or report races, and an occasional passing run does not prove safety.
+With `NewConcurrentStore()` selected, the test should pass with one success and 99,999 failures. Switching it to `NewMemoryStore()` demonstrates the unsafe implementation; a run can crash or report races, and an occasional passing run does not prove safety.
 
 The race detector requires a supported platform and a C compiler with cgo enabled. Launching 100,000 goroutines can consume substantial resources, especially with race detection.
 
@@ -130,4 +132,29 @@ To run the entry point:
 go run ./cmd
 ```
 
-It currently exits without output because `main` is empty.
+The current entry point listens on port 8080. Requests receive HTTP 404 because no routes are registered.
+
+
+## Publish the `02/concurrent-store` branch
+
+Create a branch from the commit containing the in-memory concurrent-store stage. If that is your current commit, run:
+
+```sh
+git switch -c 02/concurrent-store
+```
+
+If the stage is on `01/memory-store` instead, use `git switch -c 02/concurrent-store 01/memory-store`. Check `git log --oneline --all` first to choose the right starting point. Switching branches may be blocked if your newer uncommitted changes conflict; preserve those changes before switching.
+
+Once this branch contains the concurrent-store implementation and its test selects `NewConcurrentStore()`, run:
+
+```sh
+go test ./...
+go test -race ./...
+git add README.md internal/booking/concurrent_Store.go
+git add -p internal/booking/service_test.go
+git diff --cached
+git commit -m "Document and test concurrent booking store with pessimistic locking"
+git push -u origin 02/concurrent-store
+```
+
+Use interactive staging to include only the concurrent-store test changes. Review the staged diff before committing, and commit and push after the tests pass. If the implementation is already committed, only stage the remaining documentation and test changes. Keep the later Redis work out of this stage's commit. The `-u` option sets the upstream so future pushes can use `git push`.
